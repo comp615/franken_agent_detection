@@ -7,8 +7,8 @@ use walkdir::WalkDir;
 
 use super::scan::ScanContext;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
 };
 use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
 
@@ -320,6 +320,9 @@ fn scan_codex_with_callback(
                                 }
 
                                 update_time_bounds(&mut started_at, &mut ended_at, created);
+                                let invocations = payload
+                                    .get("content")
+                                    .map_or_else(Vec::new, extract_invocations_from_content_blocks);
 
                                 messages.push(NormalizedMessage {
                                     idx: 0,
@@ -332,6 +335,7 @@ fn scan_codex_with_callback(
                                     } else {
                                         val
                                     },
+                                    invocations,
                                     snippets: Vec::new(),
                                 });
                             }
@@ -363,6 +367,7 @@ fn scan_codex_with_callback(
                                                 } else {
                                                     val
                                                 },
+                                                invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
                                         }
@@ -389,9 +394,53 @@ fn scan_codex_with_callback(
                                                 } else {
                                                     val
                                                 },
+                                                invocations: Vec::new(),
                                                 snippets: Vec::new(),
                                             });
                                         }
+                                    }
+                                    Some("tool_call") => {
+                                        let tool_name = payload
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        let call_id = payload
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from);
+                                        let arguments = payload
+                                            .get("input")
+                                            .cloned();
+                                        let content_str =
+                                            format!("[Tool: {tool_name}]");
+                                        update_time_bounds(
+                                            &mut started_at,
+                                            &mut ended_at,
+                                            created,
+                                        );
+                                        messages.push(NormalizedMessage {
+                                            idx: 0,
+                                            role: "assistant".to_string(),
+                                            author: None,
+                                            created_at: created,
+                                            content: content_str,
+                                            extra: if compact_message_extra {
+                                                CodexConnector::compact_message_extra(&val)
+                                            } else {
+                                                val
+                                            },
+                                            invocations: vec![
+                                                crate::types::NormalizedInvocation {
+                                                    kind: "tool".to_string(),
+                                                    name: tool_name,
+                                                    raw_name: None,
+                                                    call_id,
+                                                    arguments,
+                                                },
+                                            ],
+                                            snippets: Vec::new(),
+                                        });
                                     }
                                     Some("token_count") => {
                                         if let Some(token_usage) =
@@ -457,6 +506,9 @@ fn scan_codex_with_callback(
                             } else {
                                 item.clone()
                             },
+                            invocations: item
+                                .get("content")
+                                .map_or_else(Vec::new, extract_invocations_from_content_blocks),
                             snippets: Vec::new(),
                         });
                     }
@@ -2002,10 +2054,19 @@ not valid json at all
         );
         let convs = result.unwrap();
         assert_eq!(convs.len(), 1);
-        // Only user_message event should produce a message
-        assert_eq!(convs[0].messages.len(), 1);
-        assert_eq!(convs[0].messages[0].content, "Real user input");
-        assert_eq!(convs[0].messages[0].role, "user");
+        // user_message + tool_call events produce messages; streaming/tool_result are skipped
+        assert_eq!(convs[0].messages.len(), 2);
+
+        let tool_msg = &convs[0].messages[0];
+        assert_eq!(tool_msg.role, "assistant");
+        assert_eq!(tool_msg.content, "[Tool: bash]");
+        assert_eq!(tool_msg.invocations.len(), 1);
+        assert_eq!(tool_msg.invocations[0].name, "bash");
+        assert_eq!(tool_msg.invocations[0].kind, "tool");
+        assert_eq!(tool_msg.invocations[0].arguments.as_ref().unwrap()["cmd"], "ls");
+
+        assert_eq!(convs[0].messages[1].content, "Real user input");
+        assert_eq!(convs[0].messages[1].role, "user");
     }
 
     #[test]
